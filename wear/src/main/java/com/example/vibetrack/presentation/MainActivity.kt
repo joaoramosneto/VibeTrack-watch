@@ -27,6 +27,7 @@ import com.example.vibetrack.presentation.theme.VibeTrackTheme
 // Importações para o ViewModel e State
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.vibetrack.presentation.viewmodel.MainViewModel
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
