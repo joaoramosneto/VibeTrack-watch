@@ -17,13 +17,12 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.vibetrack.R
 import com.example.vibetrack.data.SensorDataPoint
+import com.example.vibetrack.data.HealthData
+import com.example.vibetrack.data.HeartRate
+import com.google.android.gms.wearable.Wearable
+import com.google.gson.Gson
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
-import java.io.FileOutputStream
-import java.io.OutputStreamWriter
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class SensorCollectionService : Service(), SensorEventListener {
 
@@ -33,11 +32,17 @@ class SensorCollectionService : Service(), SensorEventListener {
     private var latestGyro = FloatArray(3)
     private val dataBuffer = mutableListOf<SensorDataPoint>()
 
+    // --- LÓGICA DE PASSOS ATUALIZADA ---
+    private var stepCounterSensor: Sensor? = null
+    private var initialStepCount: Int = -1
+    private var latestStepCount: Int = -1
+    // ------------------------------------
+
     private val handler = Handler(Looper.getMainLooper())
     private val dataAssemblyRunnable = object : Runnable {
         override fun run() {
             assembleDataPoint()
-            handler.postDelayed(this, 1000)
+            handler.postDelayed(this, 1000) // Coleta a cada 1 segundo
         }
     }
 
@@ -49,11 +54,14 @@ class SensorCollectionService : Service(), SensorEventListener {
     private val _dataFlow = MutableSharedFlow<SensorDataPoint>()
     val dataFlow: SharedFlow<SensorDataPoint> = _dataFlow
 
+    private val EXPERIMENT_DATA_PATH = "/experiment-data"
+
     companion object {
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
         const val NOTIFICATION_CHANNEL_ID = "VibeTrackChannel"
         const val NOTIFICATION_ID = 1
+        private const val TAG = "SensorCollectionService"
     }
 
     override fun onCreate() {
@@ -65,21 +73,28 @@ class SensorCollectionService : Service(), SensorEventListener {
         when (intent?.action) {
             ACTION_START -> {
                 dataBuffer.clear()
+                // Reseta a contagem de passos
+                initialStepCount = -1
+                latestStepCount = -1
                 startForeground(NOTIFICATION_ID, createNotification())
                 registerSensors()
                 handler.post(dataAssemblyRunnable)
-                Log.d("SensorService", "Coleta iniciada.")
+                Log.d(TAG, "Coleta iniciada.")
             }
             ACTION_STOP -> {
                 unregisterSensors()
                 handler.removeCallbacks(dataAssemblyRunnable)
+
                 if (dataBuffer.isNotEmpty()) {
-                    saveDataToFile()
+                    sendDataToMobile()
+                } else {
+                    Log.w(TAG, "Buffer de dados vazio, nada para enviar.")
                 }
+
                 dataBuffer.clear()
                 stopForeground(true)
                 stopSelf()
-                Log.d("SensorService", "Coleta parada.")
+                Log.d(TAG, "Coleta parada e dados enviados.")
             }
         }
         return START_NOT_STICKY
@@ -93,6 +108,19 @@ class SensorCollectionService : Service(), SensorEventListener {
             Sensor.TYPE_HEART_RATE -> latestHeartRate = event.values[0]
             Sensor.TYPE_ACCELEROMETER -> latestAccel = event.values.clone()
             Sensor.TYPE_GYROSCOPE -> latestGyro = event.values.clone()
+
+            // --- LÓGICA DE PASSOS ATUALIZADA ---
+            Sensor.TYPE_STEP_COUNTER -> {
+                val count = event.values[0].toInt()
+                if (initialStepCount == -1) {
+                    // Armazena o primeiro valor que o sensor reporta
+                    initialStepCount = count
+                }
+                // Atualiza o valor mais recente
+                latestStepCount = count
+                Log.d(TAG, "Contagem de passos atualizada: $latestStepCount (inicial: $initialStepCount)")
+            }
+            // ------------------------------------
         }
     }
 
@@ -105,21 +133,36 @@ class SensorCollectionService : Service(), SensorEventListener {
         val heartRateSensor = sensorManager.getDefaultSensor(Sensor.TYPE_HEART_RATE)
         val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+
+        // --- LÓGICA DE PASSOS ATUALIZADA ---
+        stepCounterSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+        // ------------------------------------
+
         sensorManager.registerListener(this, heartRateSensor, SensorManager.SENSOR_DELAY_NORMAL)
         sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_NORMAL)
         sensorManager.registerListener(this, gyroscope, SensorManager.SENSOR_DELAY_NORMAL)
+
+        // --- LÓGICA DE PASSOS ATUALIZADA ---
+        stepCounterSensor?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+            Log.d(TAG, "Sensor de passos registrado.")
+        } ?: run {
+            Log.e(TAG, "Sensor de passos (STEP_COUNTER) não encontrado neste dispositivo.")
+        }
+        // ------------------------------------
     }
 
     private fun unregisterSensors() {
         if (::sensorManager.isInitialized) {
             sensorManager.unregisterListener(this)
+            Log.d(TAG, "Todos os listeners de sensores foram desregistrados.")
         }
     }
 
     private fun assembleDataPoint() {
         val newPoint = SensorDataPoint(
             timestamp = System.currentTimeMillis(),
-            heartRate = latestHeartRate,
+            heartRate = if (latestHeartRate > 0) latestHeartRate else null, // Salva null se HR for 0
             accelX = latestAccel.getOrElse(0) { 0f },
             accelY = latestAccel.getOrElse(1) { 0f },
             accelZ = latestAccel.getOrElse(2) { 0f },
@@ -128,28 +171,64 @@ class SensorCollectionService : Service(), SensorEventListener {
             gyroZ = latestGyro.getOrElse(2) { 0f }
         )
         dataBuffer.add(newPoint)
-        Log.d("SensorService", "Novo Ponto Coletado: $newPoint")
-        _dataFlow.tryEmit(newPoint)
+        // Não precisamos mais logar *cada* ponto, vamos comentar para logs mais limpos
+        // Log.d(TAG, "Novo Ponto Coletado: $newPoint")
     }
 
-    private fun saveDataToFile() {
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-        val fileName = "session_$timestamp.csv"
-        val header = "timestamp,heartRate,accelX,accelY,accelZ,gyroX,gyroY,gyroZ\n"
-        try {
-            val fileOutputStream: FileOutputStream = openFileOutput(fileName, Context.MODE_PRIVATE)
-            val writer = OutputStreamWriter(fileOutputStream)
-            writer.write(header)
-            dataBuffer.forEach { dataPoint ->
-                val line = "${dataPoint.timestamp},${dataPoint.heartRate},${dataPoint.accelX},${dataPoint.accelY},${dataPoint.accelZ},${dataPoint.gyroX},${dataPoint.gyroY},${dataPoint.gyroZ}\n"
-                writer.write(line)
+    private fun sendDataToMobile() {
+        // 1. Processar dados de Frequência Cardíaca
+        val validHeartRates = dataBuffer.mapNotNull { it.heartRate }.filter { it > 0 }
+
+        val restingHr = validHeartRates.minOrNull()?.toInt() ?: 0
+        val averageHr = if (validHeartRates.isNotEmpty()) validHeartRates.average().toInt() else 0
+        val maxHr = validHeartRates.maxOrNull()?.toInt() ?: 0
+
+        // 2. Processar dados de Passos
+        // --- LÓGICA DE PASSOS ATUALIZADA ---
+        val steps = if (initialStepCount != -1 && latestStepCount != -1 && latestStepCount > initialStepCount) {
+            latestStepCount - initialStepCount
+        } else {
+            0 // Nenhum passo detectado ou dados inválidos
+        }
+        // ------------------------------------
+
+        // 3. Montar os objetos de dados
+        val heartRateData = HeartRate(resting = restingHr, average = averageHr, max = maxHr)
+        val healthData = HealthData(steps = steps, heartRate = heartRateData)
+
+        // 4. Serializar para JSON
+        val gson = Gson()
+        val jsonMessage = gson.toJson(healthData)
+        Log.d(TAG, "Enviando JSON para o celular: $jsonMessage") // << VERIFIQUE ESTE LOG!
+
+        // 5. Enviar mensagem para o celular
+        Handler(Looper.getMainLooper()).post {
+            try {
+                val nodesTask = Wearable.getNodeClient(this).connectedNodes
+
+                nodesTask.addOnSuccessListener { nodes ->
+                    if (nodes.isEmpty()) {
+                        Log.w(TAG, "Nenhum celular conectado encontrado.")
+                        return@addOnSuccessListener
+                    }
+                    nodes.forEach { node ->
+                        Log.d(TAG, "Tentando enviar mensagem para: ${node.displayName}")
+                        Wearable.getMessageClient(this).sendMessage(
+                            node.id,
+                            EXPERIMENT_DATA_PATH,
+                            jsonMessage.toByteArray(Charsets.UTF_8)
+                        ).apply {
+                            addOnSuccessListener { Log.d(TAG, "Mensagem enviada com sucesso para ${node.displayName}") }
+                            addOnFailureListener { e -> Log.e(TAG, "Falha ao enviar mensagem para ${node.displayName}", e) }
+                        }
+                    }
+                }
+                nodesTask.addOnFailureListener { e ->
+                    Log.e(TAG, "Falha ao buscar nós conectados", e)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Exceção ao tentar enviar mensagem", e)
             }
-            writer.close()
-            fileOutputStream.close()
-            Log.d("SensorService", "Dados salvos com sucesso no arquivo: $fileName")
-        } catch (e: Exception) {
-            Log.e("SensorService", "Erro ao salvar o arquivo: ${e.message}")
-            e.printStackTrace()
         }
     }
 
@@ -165,7 +244,6 @@ class SensorCollectionService : Service(), SensorEventListener {
         notificationManager.createNotificationChannel(channel)
     }
 
-    // AQUI ESTÁ A CORREÇÃO - O CÓDIGO COMPLETO DA FUNÇÃO
     private fun createNotification() = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
         .setContentTitle("VibeTrack Coletando")
         .setContentText("A coleta de dados está ativa.")
